@@ -7,7 +7,7 @@ import android.os.Looper
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
 
-/** Shows the app logo with "from Raj", then goes to the Permission Center (first launch only) and then straight into the app. */
+/** Shows the app logo with "from Raj", then goes straight into the app (no permissions needed). */
 class SplashActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -26,12 +26,7 @@ class SplashActivity : AppCompatActivity() {
 
     private fun route() {
         if (isFinishing || isDestroyed) return
-        val next = if (!Prefs.permsShown(this)) {
-            // First launch: show the Permission Center once.
-            Intent(this, PermissionsActivity::class.java).putExtra(PermissionsActivity.EXTRA_FIRST, true)
-        } else {
-            Router.next(this)
-        }
+        val next = Router.next(this)
         startActivity(next)
         finish()
         overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out)

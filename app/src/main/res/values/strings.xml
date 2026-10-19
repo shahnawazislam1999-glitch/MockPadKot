@@ -4,7 +4,4 @@
     <string name="tagline">Mock Test</string>
     <string name="from_label">from</string>
     <string name="from_name">RAJ</string>
-    <string name="shortcut_perm">Permissions</string>
-    <string name="a11y_label">MockPad</string>
-    <string name="a11y_desc">Lets MockPad use accessibility features in the future.</string>
 </resources>

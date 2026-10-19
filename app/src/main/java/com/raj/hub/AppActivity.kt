@@ -5,7 +5,9 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
@@ -47,6 +49,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewAssetLoader
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
 import java.io.InputStream
@@ -147,10 +150,74 @@ class AppActivity : AppCompatActivity() {
     private var lastBack = 0L
     private var ready = false
 
+    // true while the file picker was opened by an image / PDF upload (question + answer images)
+    private var pickingImages = false
+
     private val chooser = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val cb = fileCallback
         fileCallback = null
-        cb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(r.resultCode, r.data))
+        if (cb == null) return@registerForActivityResult
+        val uris = WebChromeClient.FileChooserParams.parseResult(r.resultCode, r.data)
+        if (uris == null || uris.isEmpty() || !pickingImages) {
+            cb.onReceiveValue(uris)
+            return@registerForActivityResult
+        }
+        // Gallery / Google Photos give temporary, provider-specific links that the page often cannot read.
+        // Copy each picked image into the app's own cache and hand the page a plain file instead.
+        Bg.run {
+            val out = ArrayList<Uri>()
+            for (u in uris) out.add(copyPicked(u) ?: u)
+            runOnUiThread { cb.onReceiveValue(out.toTypedArray()) }
+        }
+    }
+
+    /** Copies one picked file into cache/picks. JPEG / PNG / PDF are copied as they are, any other image (WebP, HEIC, GIF...) becomes a JPEG. */
+    private fun copyPicked(u: Uri): Uri? {
+        if (u.scheme == "file") return null
+        return try {
+            val dir = File(cacheDir, "picks")
+            dir.mkdirs()
+            var name: String? = null
+            contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) name = c.getString(0)
+            }
+            val base = (name ?: "image").substringBeforeLast('.')
+                .replace(Regex("[^A-Za-z0-9_-]"), "_").take(40).ifBlank { "image" }
+            val head = ByteArray(12)
+            val n = contentResolver.openInputStream(u)?.use { it.read(head) } ?: return null
+            fun has(vararg b: Int): Boolean = b.indices.all { it < n && head[it] == b[it].toByte() }
+            val ext: String? = when {
+                has(0x25, 0x50, 0x44, 0x46) -> "pdf"
+                has(0x89, 0x50, 0x4E, 0x47) -> "png"
+                has(0xFF, 0xD8, 0xFF) -> "jpg"
+                else -> null
+            }
+            val dest = File(dir, base + "_" + System.nanoTime() + "." + (ext ?: "jpg"))
+            if (ext != null) {
+                val input = contentResolver.openInputStream(u) ?: return null
+                input.use { i -> dest.outputStream().use { o -> i.copyTo(o) } }
+            } else {
+                val bmp = ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, u)) { d, _, _ ->
+                    d.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                }
+                dest.outputStream().use { o -> bmp.compress(Bitmap.CompressFormat.JPEG, 92, o) }
+                bmp.recycle()
+            }
+            if (dest.length() <= 0L) { dest.delete(); return null }
+            Uri.fromFile(dest)
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    /** Removes picked-file copies older than an hour. */
+    private fun cleanPicks() {
+        Bg.run {
+            try {
+                val limit = System.currentTimeMillis() - 60L * 60 * 1000
+                File(cacheDir, "picks").listFiles()?.forEach { if (it.lastModified() < limit) it.delete() }
+            } catch (e: Exception) { }
+        }
     }
 
     // ==== ANCHOR: remembered video (played by the native ExoPlayer, see NativeVideo.kt) ====
@@ -533,6 +600,8 @@ class AppActivity : AppCompatActivity() {
                             it == ".jpg" || it == ".jpeg" || it == ".png" || it == ".webp"
                     }
                     intent.type = "*/*"
+                    pickingImages = imagesOnly
+                    if (imagesOnly) cleanPicks()
                     if (imagesOnly) {
                         // Question / answer image upload: show photos and PDFs (opens the normal Gallery picker).
                         intent.putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "application/pdf"))
