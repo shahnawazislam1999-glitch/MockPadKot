@@ -65,15 +65,56 @@ class AppActivity : AppCompatActivity() {
   window.__rajHook = true;
   function send(url, name) {
     fetch(url).then(function (r) { return r.blob(); }).then(function (b) {
-      if (b.size > 120 * 1024 * 1024) { alert('This file is too big to save from inside the app.'); return; }
-      var fr = new FileReader();
-      fr.onloadend = function () {
-        var s = String(fr.result);
-        RajBridge.save(name || 'download', b.type || 'application/octet-stream', s.substring(s.indexOf(',') + 1));
-      };
-      fr.readAsDataURL(b);
+      var mime = b.type || 'application/octet-stream';
+      var id = String(Date.now()) + '_' + Math.floor(Math.random() * 100000);
+      var CH = 3 * 1024 * 1024; // multiple of 3 so each base64 piece decodes on its own
+      var pos = 0;
+      if (!RajBridge.saveBegin(id, name || 'download', mime)) { alert('Could not save the file.'); return; }
+      function next() {
+        if (pos >= b.size) { RajBridge.saveEnd(id); return; }
+        var fr = new FileReader();
+        fr.onloadend = function () {
+          var s = String(fr.result);
+          if (!RajBridge.saveChunk(id, s.substring(s.indexOf(',') + 1))) {
+            RajBridge.saveAbort(id);
+            alert('Could not save the file.');
+            return;
+          }
+          pos += CH;
+          next();
+        };
+        fr.onerror = function () { RajBridge.saveAbort(id); alert('Could not save the file.'); };
+        fr.readAsDataURL(b.slice(pos, pos + CH));
+      }
+      next();
     }).catch(function () { alert('Could not save the file.'); });
   }
+  // FIX: Android often gives picked images an empty type. The page ignores files that are not
+  // image/png, image/jpeg or PDF, so question/answer images silently never arrived. Give them a real type first.
+  var EXT_TYPES = { jpg: 'image/jpeg', jpeg: 'image/jpeg', jpe: 'image/jpeg', jfif: 'image/jpeg', png: 'image/png', pdf: 'application/pdf', webp: 'image/webp', gif: 'image/gif', bmp: 'image/bmp' };
+  function badType(t) { t = (t || '').toLowerCase(); return !t || t === 'application/octet-stream'; }
+  document.addEventListener('change', function (e) {
+    var inp = e.target;
+    if (!inp || inp.tagName !== 'INPUT' || inp.type !== 'file' || !inp.files || !inp.files.length) return;
+    if ((inp.getAttribute('accept') || '').toLowerCase().indexOf('image') < 0) return;
+    var need = false, i;
+    for (i = 0; i < inp.files.length; i++) { if (badType(inp.files[i].type)) need = true; }
+    if (!need) return;
+    try {
+      var dt = new DataTransfer();
+      for (i = 0; i < inp.files.length; i++) {
+        var f = inp.files[i];
+        if (badType(f.type)) {
+          var m = /[.]([a-z0-9]+)$/i.exec(f.name || '');
+          var t = (m && EXT_TYPES[m[1].toLowerCase()]) || 'image/jpeg';
+          f = new File([f], f.name || ('image_' + i + '.jpg'), { type: t, lastModified: f.lastModified });
+        }
+        dt.items.add(f);
+      }
+      inp.files = dt.files;
+    } catch (err) { }
+  }, true);
+
   var origClick = HTMLAnchorElement.prototype.click;
   HTMLAnchorElement.prototype.click = function () {
     if (this.hasAttribute('download') && /^(blob:|data:)/.test(this.href)) {
@@ -482,10 +523,23 @@ class AppActivity : AppCompatActivity() {
                     } catch (e: Exception) {
                         Intent(Intent.ACTION_GET_CONTENT).addCategory(Intent.CATEGORY_OPENABLE)
                     }
-                    // Never filter by type: .srt has no Android MIME type and big .mkv files are often hidden by filters.
-                    intent.type = "*/*"
-                    intent.removeExtra(Intent.EXTRA_MIME_TYPES)
                     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, fileChooserParams.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE)
+                    val accepts = (fileChooserParams.acceptTypes ?: emptyArray())
+                        .map { it.trim().lowercase() }
+                        .filter { it.isNotEmpty() }
+                    val imagesOnly = accepts.isNotEmpty() && accepts.all {
+                        it.startsWith("image/") || it.contains("pdf") ||
+                            it == ".jpg" || it == ".jpeg" || it == ".png" || it == ".webp"
+                    }
+                    intent.type = "*/*"
+                    if (imagesOnly) {
+                        // Question / answer image upload: show photos and PDFs (opens the normal Gallery picker).
+                        intent.putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "application/pdf"))
+                    } else {
+                        // Never filter other uploads: .srt has no Android MIME type and big .mkv files are often hidden by filters.
+                        intent.removeExtra(Intent.EXTRA_MIME_TYPES)
+                    }
                     chooser.launch(intent)
                     true
                 } catch (e: Exception) {
@@ -672,6 +726,70 @@ class AppActivity : AppCompatActivity() {
         @JavascriptInterface
         fun notify(title: String, text: String) {
             Notifier.show(this@AppActivity, title, text)
+        }
+
+        // ---- chunked save: big backups are written piece by piece so they never fill the phone's memory ----
+        private inner class SaveJob(val uri: Uri, val out: java.io.OutputStream, val name: String)
+
+        private val saves = HashMap<String, SaveJob>()
+
+        @JavascriptInterface
+        fun saveBegin(id: String, name: String, mime: String): Boolean {
+            return try {
+                val safe = name.replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "download" }
+                val values = ContentValues()
+                values.put(MediaStore.Downloads.DISPLAY_NAME, safe)
+                values.put(MediaStore.Downloads.MIME_TYPE, if (mime.isBlank()) "application/octet-stream" else mime)
+                values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/" + app.name)
+                values.put(MediaStore.Downloads.IS_PENDING, 1)
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
+                val out = contentResolver.openOutputStream(uri)
+                if (out == null) {
+                    contentResolver.delete(uri, null, null)
+                    return false
+                }
+                synchronized(saves) { saves[id] = SaveJob(uri, out, safe) }
+                true
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+        @JavascriptInterface
+        fun saveChunk(id: String, base64: String): Boolean {
+            val job = synchronized(saves) { saves[id] } ?: return false
+            return try {
+                job.out.write(Base64.decode(base64, Base64.DEFAULT))
+                true
+            } catch (e: Throwable) {
+                saveAbort(id)
+                false
+            }
+        }
+
+        @JavascriptInterface
+        fun saveEnd(id: String) {
+            val job = synchronized(saves) { saves.remove(id) } ?: return
+            try {
+                job.out.flush()
+                job.out.close()
+                val done = ContentValues()
+                done.put(MediaStore.Downloads.IS_PENDING, 0)
+                contentResolver.update(job.uri, done, null, null)
+                runOnUiThread {
+                    Toast.makeText(this@AppActivity, "Saved to Downloads/${app.name}/${job.name}", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                try { contentResolver.delete(job.uri, null, null) } catch (x: Exception) { }
+                runOnUiThread { Toast.makeText(this@AppActivity, "Could not save the file", Toast.LENGTH_LONG).show() }
+            }
+        }
+
+        @JavascriptInterface
+        fun saveAbort(id: String) {
+            val job = synchronized(saves) { saves.remove(id) } ?: return
+            try { job.out.close() } catch (e: Exception) { }
+            try { contentResolver.delete(job.uri, null, null) } catch (e: Exception) { }
         }
 
         @JavascriptInterface
